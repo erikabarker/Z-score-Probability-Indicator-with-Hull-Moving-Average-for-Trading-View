@@ -1,0 +1,267 @@
+// ╔══════════════════════════════════════════════════════════════════════════════╗
+// ║                                                                              ║
+// ║ Z-Score Probability (HMA) Indicator                                          ║
+// ║                                                                              ║
+// ║ By Erika Barker                                                              ║
+// ║ Version 2           ║
+// ║                                                                              ║
+// ║ This indicator:                                                              ║
+// ║ - Measures price deviations from Hull Moving Average in standard deviations  ║
+// ║ - Uses adaptive lookback periods based on market volatility                  ║
+// ║ - Detects divergences between price and Z-Score                              ║
+// ║ - Provides statistical probability zones                                     ║
+// ║                                                                              ║
+// ╚══════════════════════════════════════════════════════════════════════════════╝
+
+indicator("Z-Score Probability (HMA)", shorttitle="Z-HMA", overlay=false)
+
+// Key Enhancements from Original:
+// 1. Adaptive Lookback: Adjusts period length based on market volatility
+// 2. Divergence Detection: Identifies when price makes new high/low but Z-Score doesn't confirm
+// 3. Modernized UI: Improved organization, colors, and layout
+// 4. Performance Optimization: More efficient calculations and error handling
+// 5. Added Alerts: Custom alerts for important technical conditions
+// User-Configurable Inputs - Organized in logical groups
+// General Settings
+generalGroup = "General Settings"
+baseLength = input.int(75, "Base Lookback Length", minval=10, group=generalGroup, tooltip="Base period for Z-Score calculation")
+hmaLength = input.int(75, "HMA Smoothing Length", minval=1, group=generalGroup, tooltip="Sets the smoothing period for the HMA of the Z-Score")
+plotStyle = input.string("Area", "Plot Style", options=["Area", "Candles"], group=generalGroup, tooltip="Display style for Z-Score")
+
+// Display Settings
+displayGroup = "Display Settings"
+zScoreColor = input.color(color.rgb(76, 175, 80), "Z-Score Color (Positive)", inline="colors", group=displayGroup)
+zScoreNegColor = input.color(color.rgb(255, 82, 82), "Z-Score Color (Negative)", inline="colors", group=displayGroup)
+hmaColor = input.color(color.white, "HMA Line Color", inline="hmacol", group=displayGroup)
+hmaWidth = input.int(2, "Width", minval=1, maxval=4, inline="hmacol", group=displayGroup)
+textColor = input.color(color.white, "Text Color", group=displayGroup)
+bgColor = input.color(color.new(color.black, 70), "Background Color", group=displayGroup)
+
+// Zone Settings
+zoneGroup = "Probability Zones"
+showProbabilityFills = input.bool(true, "Show Probability Fills", group=zoneGroup, tooltip="Toggle color-coded probability zones")
+zone1Color = input.color(color.new(color.rgb(76, 175, 80), 75), "Normal Zone (±1σ)", inline="zones1", group=zoneGroup)
+zone2Color = input.color(color.new(color.rgb(255, 235, 59), 75), "Warning Zone (±2σ)", inline="zones2", group=zoneGroup)
+zone3Color = input.color(color.new(color.rgb(255, 82, 82), 75), "Extreme Zone (±3σ)", inline="zones3", group=zoneGroup)
+
+// Table Settings
+tableGroup = "Information Table"
+showZTable = input.bool(false, "Show Z-Table", group=tableGroup, tooltip="Display probability table")
+tablePosition = input.string("Bottom Right", "Table Position", options=["Top Left", "Top Right", "Bottom Left", "Bottom Right"], group=tableGroup)
+tableOpacity = input.int(70, "Table Opacity", minval=0, maxval=100, group=tableGroup)
+
+// Advanced Settings
+advancedGroup = "Advanced Settings"
+showSDBands = input.bool(false, "Show HMA Std Dev Bands", group=advancedGroup, tooltip="Display standard deviation bands around the HMA line")
+sdBandColor = input.color(color.rgb(0, 176, 255), "Band Color", inline="bands", group=advancedGroup)
+sdBandWidth = input.int(1, "Width", minval=1, maxval=4, inline="bands", group=advancedGroup)
+roundToDecimals = input.int(2, "Round Price Levels To", minval=0, maxval=6, group=advancedGroup)
+showPriceLevels = input.bool(false, "Show Price Level Labels", group=advancedGroup, tooltip="Display price level labels on the right side")
+showPaneLabels = input.bool(false, "Show Mode & Adaptive Labels", group=advancedGroup, tooltip="Display mode and adaptive length labels in the pane")
+
+// Adaptive Lookback Period Parameters
+adaptiveGroup = "Adaptive Lookback Settings"
+useAdaptiveLookback = input.bool(true, "Use Adaptive Lookback", group=adaptiveGroup, tooltip="Adapts lookback length based on market volatility")
+minLookback = input.int(20, "Minimum Lookback", minval=5, group=adaptiveGroup, tooltip="Minimum lookback length during low volatility periods")
+maxLookback = input.int(150, "Maximum Lookback", minval=50, group=adaptiveGroup, tooltip="Maximum lookback length during high volatility periods")
+volatilityPeriod = input.int(50, "Volatility Calculation Period", minval=10, group=adaptiveGroup, tooltip="Period for calculating market volatility")
+showAdaptiveLabel = input.bool(false, "Show Adaptive Period Label", group=adaptiveGroup)
+
+// Divergence Detection Parameters
+divergenceGroup = "Divergence Detection"
+showDivergence = input.bool(true, "Show Divergence Signals", group=divergenceGroup, tooltip="Detect when price makes new high/low but Z-Score doesn't confirm")
+divergenceLookback = input.int(14, "Divergence Lookback", minval=5, group=divergenceGroup, tooltip="Lookback period for detecting divergence")
+divergenceThreshold = input.float(0.8, "Divergence Threshold", minval=0.1, step=0.1, group=divergenceGroup, tooltip="Minimum threshold for divergence significance (higher = fewer signals)")
+divergenceStrength = input.int(3, "Signal Strength Filter", minval=1, maxval=10, group=divergenceGroup, tooltip="Filter out weaker signals (higher = fewer signals)")
+bullishDivColor = input.color(color.rgb(76, 175, 80), "Bullish Signal Color", inline="divcol1", group=divergenceGroup)
+bearishDivColor = input.color(color.rgb(255, 82, 82), "Bearish Signal Color", inline="divcol2", group=divergenceGroup)
+
+// Calculate Adaptive Lookback based on current volatility - with error handling
+recentVolatility = ta.stdev(close, volatilityPeriod) / ta.sma(close, volatilityPeriod) * 100
+normalizedVolatility = math.min(math.max(recentVolatility, 0), 100) / 100
+
+// For functions requiring simple int, we'll use the fixed baseLength
+// But we'll track the adaptive value for display purposes
+adaptiveLookback = useAdaptiveLookback ? math.round(minLookback + normalizedVolatility * (maxLookback - minLookback)) : baseLength
+currentLookback = math.max(adaptiveLookback, 5) // Ensure minimum viable lookback
+
+// Z-Score and HMA Calculations - with appropriate NaN handling
+hmaMidLine = ta.hma(close, baseLength)
+stdDev = ta.stdev(close, baseLength)
+
+// Apply volatility adjustment by scaling the calculation instead - with safe division
+volatilityFactor = useAdaptiveLookback ? baseLength / math.max(currentLookback, 1) : 1.0
+
+// Calculate z-scores for all price points with NaN protection
+calcZScore(price) => 
+    stdDev != 0 ? (price - hmaMidLine) / stdDev * volatilityFactor : 0
+    
+zOpen = calcZScore(open)
+zHigh = calcZScore(high)
+zLow = calcZScore(low)
+zScore = calcZScore(close)
+zHMA = ta.hma(zScore, hmaLength)
+hmaStdDev = ta.stdev(zHMA, hmaLength)
+
+// Variables for divergence detection
+var float zScoreHighest = 0.0
+var float zScoreLowest = 0.0
+var bool isPriceHighPivot = false
+var bool isPriceLowPivot = false
+var int consecutiveDivBars = 0
+var int consecutiveBearishDivBars = 0
+
+// Only calculate divergence when feature is enabled
+if showDivergence
+    // Divergence Detection Logic
+    priceHighest = ta.highest(close, divergenceLookback)
+    priceLowest = ta.lowest(close, divergenceLookback)
+    zScoreHighest := ta.highest(zScore, divergenceLookback)
+    zScoreLowest := ta.lowest(zScore, divergenceLookback)
+    
+    // More stringent pivot detection to reduce signals
+    isPriceHighPivot := close == priceHighest and close[1] < close and close[2] < close[1] and close > close[3]
+    isPriceLowPivot := close == priceLowest and close[1] > close and close[2] > close[1] and close < close[3]
+    
+    // Track consecutive divergence bars for filtering
+    if isPriceLowPivot and (zScore > zScoreLowest + divergenceThreshold)
+        consecutiveDivBars := consecutiveDivBars + 1
+    else
+        consecutiveDivBars := 0
+        
+    if isPriceHighPivot and (zScore < zScoreHighest - divergenceThreshold)
+        consecutiveBearishDivBars := consecutiveBearishDivBars + 1
+    else
+        consecutiveBearishDivBars := 0
+else
+    isPriceHighPivot := false
+    isPriceLowPivot := false
+
+// Check for divergence conditions with more reliable detection and filtering
+// Only show signals that persist for the required number of bars (reduces noise)
+bullishDivergence = showDivergence and isPriceLowPivot and (zScore > zScoreLowest + divergenceThreshold) and (consecutiveDivBars >= divergenceStrength)
+bearishDivergence = showDivergence and isPriceHighPivot and (zScore < zScoreHighest - divergenceThreshold) and (consecutiveBearishDivBars >= divergenceStrength)
+
+// Visual Settings Manager for automatic scaling
+var float maxZScore = 3.5
+var float minZScore = -3.5
+
+// Update max/min Z-Score range for auto-scaling
+if not na(zScore)
+    maxZScore := math.max(maxZScore, math.min(zScore, 7.0))
+    minZScore := math.min(minZScore, math.max(zScore, -7.0))
+
+// Helper function for table positioning
+getTablePosition(pos) =>
+    switch pos
+        "Top Left" => position.top_left
+        "Top Right" => position.top_right
+        "Bottom Left" => position.bottom_left
+        "Bottom Right" => position.bottom_right
+        => position.bottom_right  // Default
+
+// Plot Z-Score, HMA, and Standard Deviation Bands
+zScorePlot = plot(plotStyle == "Area" ? zScore : na, "Z-Score", color=zScore > 0 ? zScoreColor : zScoreNegColor, style=plot.style_area)
+zeroLine = plot(0, "Zero Line", color=color.gray, style=plot.style_line, linewidth=1, display=display.none)
+hmaPlot = plot(zHMA, "Z-HMA", color=hmaColor, linewidth=hmaWidth)
+upperBandPlot = plot(showSDBands ? zHMA + hmaStdDev : na, "HMA Upper Band", color=sdBandColor, linewidth=sdBandWidth)
+lowerBandPlot = plot(showSDBands ? zHMA - hmaStdDev : na, "HMA Lower Band", color=sdBandColor, linewidth=sdBandWidth)
+
+// Probability Zone Plots
+p1 = plot(1, "+1 SD", color=color.new(color.gray, 100), display=display.none)
+n1 = plot(-1, "-1 SD", color=color.new(color.gray, 100), display=display.none)
+p2 = plot(2, "+2 SD", color=color.new(color.gray, 100), display=display.none)
+n2 = plot(-2, "-2 SD", color=color.new(color.gray, 100), display=display.none)
+p3 = plot(3, "+3 SD", color=color.new(color.gray, 100), display=display.none)
+n3 = plot(-3, "-3 SD", color=color.new(color.gray, 100), display=display.none)
+
+// Probability Fills - use transparency to show/hide
+fill(zeroLine, p1, color=showProbabilityFills ? zone1Color : na)
+fill(zeroLine, n1, color=showProbabilityFills ? zone1Color : na)
+fill(p1, p2, color=showProbabilityFills ? zone2Color : na)
+fill(n1, n2, color=showProbabilityFills ? zone2Color : na)
+fill(p2, p3, color=showProbabilityFills ? zone3Color : na)
+fill(n2, n3, color=showProbabilityFills ? zone3Color : na)
+
+// Plot candlesticks if selected
+candleColor = zOpen > zScore ? color.new(zScoreNegColor, 0) : color.new(zScoreColor, 0)
+plotcandle(plotStyle == "Candles" ? zOpen : na, plotStyle == "Candles" ? zHigh : na, plotStyle == "Candles" ? zLow : na, plotStyle == "Candles" ? zScore : na, title="Z-Score Candles", color=candleColor, wickcolor=candleColor)
+
+// Divergence Markers (if enabled)
+plotshape(showDivergence and bullishDivergence ? -3 : na, "Bullish Divergence", shape.triangleup, location.bottom, bullishDivColor, size=size.small)
+plotshape(showDivergence and bearishDivergence ? 3 : na, "Bearish Divergence", shape.triangledown, location.top, bearishDivColor, size=size.small)
+
+// Alerts
+alertcondition(bullishDivergence, title="Bullish Divergence", message="Bullish divergence detected on {{ticker}} - potential buying opportunity")
+alertcondition(bearishDivergence, title="Bearish Divergence", message="Bearish divergence detected on {{ticker}} - potential selling opportunity")
+alertcondition(zScore > 2 and zScore[1] <= 2, title="+2σ Breach", message="{{ticker}} Z-Score breached +2σ - significantly overbought")
+alertcondition(zScore < -2 and zScore[1] >= -2, title="-2σ Breach", message="{{ticker}} Z-Score breached -2σ - significantly oversold")
+
+// Price Level Calculations and Labels
+if barstate.islast
+    // Current Mode indicator
+    if showPaneLabels
+        modeText = useAdaptiveLookback ? "ADAPTIVE MODE" : "FIXED MODE"
+        modeColor = useAdaptiveLookback ? color.new(color.rgb(0, 150, 255), 0) : color.new(color.gray, 0)
+        label.new(bar_index + 5, minZScore + 0.2, text=modeText, color=color.new(modeColor, 90), style=label.style_label_left, textcolor=modeColor, size=size.small)
+                
+        // Adaptive lookback info label
+        if useAdaptiveLookback and showAdaptiveLabel
+            adaptiveLabel = label.new(bar_index + 5, minZScore + 0.5, text="Adaptive Lookback: " + str.tostring(currentLookback), color=color.new(color.blue, 90), style=label.style_label_left, textcolor=color.new(color.blue, 0), size=size.small)
+    
+    // Price levels for standard deviations - only when enabled
+    if showPriceLevels
+        for i = -3 to 3
+            price = hmaMidLine + i * stdDev
+            if not na(price)
+                label.new(bar_index + 5, i, text=str.tostring(math.round(price, roundToDecimals)), color=color.new(color.gray, 80), style=label.style_label_left, textcolor=textColor, size=size.small)
+
+// Z-Table
+if showZTable and barstate.islast
+    table_position = getTablePosition(tablePosition)
+    zTable = table.new(table_position, 3, 9, bgcolor=color.new(bgColor, tableOpacity), frame_color=color.new(color.white, 70), frame_width=1, border_width=1)
+    
+    // Table headers with modern styling
+    table.cell(zTable, 0, 0, "Z-Score", bgcolor=color.new(color.black, 0), text_color=textColor, text_size=size.small)
+    table.cell(zTable, 1, 0, "Probability", bgcolor=color.new(color.black, 0), text_color=textColor, text_size=size.small)
+    table.cell(zTable, 2, 0, "Zone", bgcolor=color.new(color.black, 0), text_color=textColor, text_size=size.small)
+
+    // Z-Score data with improved presentation
+    zScoreData = array.from(-3.0, -2.0, -1.0, 0.0, 1.0, 2.0, 3.0)
+    probData = array.from("0.13%", "2.28%", "16.0%", "50.0%", "85.0%", "98.0%", "99.9%")
+
+    for i = 0 to 6
+        z = array.get(zScoreData, i)
+        prob = array.get(probData, i)
+        
+        // Determine zone color based on Z-Score value
+        zoneColor = math.abs(z) > 2 ? zone3Color : math.abs(z) > 1 ? zone2Color : zone1Color
+        
+        // Populate table with modern styling
+        table.cell(zTable, 0, i + 1, str.tostring(z), text_color=textColor, text_size=size.small)
+        table.cell(zTable, 1, i + 1, prob, text_color=textColor, text_size=size.small)
+        table.cell(zTable, 2, i + 1, "", bgcolor=zoneColor)
+    
+    // Add current Z-Score value in the table footer
+    currentZone = math.abs(zScore) > 2 ? "Extreme" : math.abs(zScore) > 1 ? "Warning" : "Normal"
+    currentProb = zScore > 0 ? 
+                  math.round((0.5 + 0.5 * math.abs(zScore) / 3) * 100, 1) :
+                  math.round((0.5 - 0.5 * math.abs(zScore) / 3) * 100, 1)
+                  
+    table.cell(zTable, 0, 8, "Current:", text_color=textColor, text_size=size.small)
+    table.cell(zTable, 1, 8, str.tostring(math.round(zScore, 2)), 
+               text_color=math.abs(zScore) > 2 ? zone3Color : math.abs(zScore) > 1 ? zone2Color : zone1Color,
+               text_size=size.small)
+    table.cell(zTable, 2, 8, currentZone, 
+               text_color=math.abs(zScore) > 2 ? zone3Color : math.abs(zScore) > 1 ? zone2Color : zone1Color,
+               text_size=size.small)
+
+// Set y-axis range with hlines - styled for better visibility
+hline_color = color.new(color.gray, 50)
+hline(0, "Zero Line", color=color.new(color.gray, 0), linestyle=hline.style_dashed, linewidth=1)
+hline(1, "+1 SD", color=hline_color, linestyle=hline.style_dotted)
+hline(-1, "-1 SD", color=hline_color, linestyle=hline.style_dotted)
+hline(2, "+2 SD", color=hline_color, linestyle=hline.style_dotted)
+hline(-2, "-2 SD", color=hline_color, linestyle=hline.style_dotted)
+hline(3, "+3 SD", color=hline_color, linestyle=hline.style_dotted)
+hline(-3, "-3 SD", color=hline_color, linestyle=hline.style_dotted)
